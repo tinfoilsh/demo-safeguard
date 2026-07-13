@@ -1,0 +1,4 @@
+demosafeguard
+*.exe
+
+.env
