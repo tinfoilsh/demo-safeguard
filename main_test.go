@@ -109,6 +109,36 @@ func TestWriteStreamEmitsSSE(t *testing.T) {
 	}
 }
 
+func TestLoadPolicies(t *testing.T) {
+	sg := &safeguardClient{}
+	if err := sg.loadPolicies(); err != nil {
+		t.Fatalf("loadPolicies: %v", err)
+	}
+	if len(sg.policies) < 2 {
+		t.Fatalf("expected at least 2 policies, got %d", len(sg.policies))
+	}
+	byStage := map[policyStage][]string{}
+	for _, p := range sg.policies {
+		byStage[p.stage] = append(byStage[p.stage], p.name)
+	}
+	if len(byStage[stageInput]) == 0 {
+		t.Error("no input-stage policies")
+	}
+	if len(byStage[stageOutput]) == 0 {
+		t.Error("no output-stage policies")
+	}
+	// The baked_bread policy must be on the output stage.
+	found := false
+	for _, p := range sg.policies {
+		if p.name == "baked_bread" && p.stage == stageOutput {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("baked_bread policy not found on output stage")
+	}
+}
+
 func TestWriteOpenAIError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeOpenAIError(rec, http.StatusForbidden, "safeguard_violation",

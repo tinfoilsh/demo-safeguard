@@ -18,27 +18,22 @@ import (
 )
 
 const (
-	proxyModelDefault = "gpt-oss-120b"
+	proxyModel        = "gpt-oss-120b"
 	listenAddrDefault = ":8080"
 )
 
 type config struct {
 	tinfoilAPIKey   string
-	safeguardModel  string
-	proxyModel      string
 	listenAddr      string
 	userCacheSecret string
 }
 
 func loadConfig() config {
-	c := config{
+	return config{
 		tinfoilAPIKey:   os.Getenv("TINFOIL_API_KEY"),
-		safeguardModel:  envOr("SAFEGUARD_MODEL", safeguardModelDefault),
-		proxyModel:      envOr("PROXY_MODEL", proxyModelDefault),
 		listenAddr:      envOr("LISTEN_ADDR", listenAddrDefault),
 		userCacheSecret: os.Getenv("TINFOIL_USER_CACHE_SECRET"),
 	}
-	return c
 }
 
 func envOr(key, fallback string) string {
@@ -67,17 +62,17 @@ func main() {
 		log.Fatalf("failed to create tinfoil client: %v", err)
 	}
 
-	sg := newSafeguardClient(client, cfg.safeguardModel)
+	sg := newSafeguardClient(client)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
-	mux.HandleFunc("/v1/chat/completions", chatHandler(client, sg, cfg.proxyModel))
+	mux.HandleFunc("/v1/chat/completions", chatHandler(client, sg))
 
 	log.Printf("demo-safeguard listening on %s (proxy=%s safeguard=%s)",
-		cfg.listenAddr, cfg.proxyModel, cfg.safeguardModel)
+		cfg.listenAddr, proxyModel, safeguardModel)
 	srv := &http.Server{
 		Addr:              cfg.listenAddr,
 		Handler:           mux,
@@ -90,7 +85,7 @@ func main() {
 
 // chatHandler returns a handler that proxies chat completions to gpt-oss with
 // safeguard checks on both input and output.
-func chatHandler(client *tinfoil.Client, sg *safeguardClient, proxyModel string) http.HandlerFunc {
+func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := readBody(w, r)
 		if err != nil {
@@ -114,15 +109,15 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient, proxyModel string)
 		// 1. Safeguard the input: concatenate every message's text content.
 		inputText := extractMessagesText(params.Messages)
 		if inputText != "" {
-			res, err := sg.check(r.Context(), inputText)
+			v, err := sg.checkStage(r.Context(), stageInput, inputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
 					"input safeguard check failed: "+err.Error(), "")
 				return
 			}
-			if res.Violation {
+			if v != nil {
 				writeOpenAIError(w, http.StatusForbidden, "safeguard_violation",
-					"input blocked by safeguard: "+res.Rationale, "input")
+					fmt.Sprintf("input blocked by safeguard policy %q: %s", v.policy, v.rationale), "input")
 				return
 			}
 		}
@@ -145,15 +140,15 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient, proxyModel string)
 		// 3. Safeguard the output.
 		outputText := extractCompletionText(completion)
 		if outputText != "" {
-			res, err := sg.check(r.Context(), outputText)
+			v, err := sg.checkStage(r.Context(), stageOutput, outputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
 					"output safeguard check failed: "+err.Error(), "")
 				return
 			}
-			if res.Violation {
+			if v != nil {
 				writeOpenAIError(w, http.StatusForbidden, "safeguard_violation",
-					"output blocked by safeguard: "+res.Rationale, "output")
+					fmt.Sprintf("output blocked by safeguard policy %q: %s", v.policy, v.rationale), "output")
 				return
 			}
 		}
