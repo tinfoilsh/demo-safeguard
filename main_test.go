@@ -52,12 +52,12 @@ func TestLoadPolicies(t *testing.T) {
 
 	found := false
 	for _, p := range sg.policies {
-		if p.name == "crime" && p.stage == stageTurn {
+		if p.name == "trained_dolphins" && p.stage == stageTurn {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("crime policy not found on turn stage")
+		t.Error("trained_dolphins policy not found on turn stage")
 	}
 
 	if len(sg.groups) < 2 {
