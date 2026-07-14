@@ -94,10 +94,11 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 			return
 		}
 
-		// Detect streaming intent from the raw JSON. The openai-go params type
-		// does not surface `stream` as a field (it is set out-of-band via
-		// WithJSONSet), so decode it separately.
-		wantStream := streamRequested(body)
+		// Parse streaming intent and policy group from the raw JSON. The
+		// openai-go params type does not surface `stream` as a field (it is
+		// set out-of-band via WithJSONSet), and `policy_group` is a custom
+		// extension field, so both are decoded separately.
+		meta := parseRequestMeta(body)
 
 		var params openai.ChatCompletionNewParams
 		if err := json.Unmarshal(body, &params); err != nil {
@@ -106,10 +107,18 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 			return
 		}
 
+		// Resolve which policy group to apply for this request.
+		group, ok := sg.resolveGroup(meta.PolicyGroup)
+		if !ok {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("unknown policy_group %q", meta.PolicyGroup), "")
+			return
+		}
+
 		// 1. Safeguard the input: concatenate every message's text content.
 		inputText := extractMessagesText(params.Messages)
 		if inputText != "" {
-			v, err := sg.checkStage(r.Context(), stageInput, inputText)
+			v, err := sg.checkStage(r.Context(), stageInput, group, inputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
 					"input safeguard check failed: "+err.Error(), "")
@@ -140,7 +149,7 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 		// 3. Safeguard the output.
 		outputText := extractCompletionText(completion)
 		if outputText != "" {
-			v, err := sg.checkStage(r.Context(), stageOutput, outputText)
+			v, err := sg.checkStage(r.Context(), stageOutput, group, outputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
 					"output safeguard check failed: "+err.Error(), "")
@@ -153,9 +162,27 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 			}
 		}
 
-		// 4. Respond. Buffer the full completion, then stream it back to the
+		// 4. Safeguard the turn: check all turn-stage policies in the group
+		// against the combined input + output. This lets policies reason about
+		// the full conversation (e.g. did the model help commit a crime).
+		if inputText != "" || outputText != "" {
+			turnText := formatTurnText(inputText, outputText)
+			v, err := sg.checkStage(r.Context(), stageTurn, group, turnText)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "server_error",
+					"turn safeguard check failed: "+err.Error(), "")
+				return
+			}
+			if v != nil {
+				writeOpenAIError(w, http.StatusForbidden, "safeguard_violation",
+					fmt.Sprintf("turn blocked by safeguard policy %q: %s", v.policy, v.rationale), "turn")
+				return
+			}
+		}
+
+		// 5. Respond. Buffer the full completion, then stream it back to the
 		// caller if they asked for streaming.
-		if wantStream {
+		if meta.Stream {
 			writeStream(w, completion)
 		} else {
 			writeJSON(w, http.StatusOK, completion)
@@ -170,15 +197,18 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return io.ReadAll(r.Body)
 }
 
-// streamRequested reports whether the raw request JSON has "stream": true.
-func streamRequested(body []byte) bool {
-	var probe struct {
-		Stream bool `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil {
-		return false
-	}
-	return probe.Stream
+// requestMeta holds fields parsed from the raw request body that the
+// openai-go params type does not surface.
+type requestMeta struct {
+	Stream      bool   `json:"stream"`
+	PolicyGroup string `json:"policy_group"`
+}
+
+// parseRequestMeta extracts stream and policy_group from the raw JSON body.
+func parseRequestMeta(body []byte) requestMeta {
+	var m requestMeta
+	_ = json.Unmarshal(body, &m)
+	return m
 }
 
 // extractMessagesText concatenates the text content of every message, prefixed
@@ -227,6 +257,18 @@ func messageContentText(content any) string {
 		return b.String()
 	}
 	return ""
+}
+
+// formatTurnText combines input and output into a single text for turn-stage
+// policies, which reason about the full conversation.
+func formatTurnText(input, output string) string {
+	if input == "" {
+		return "Model output:\n" + output
+	}
+	if output == "" {
+		return "User input:\n" + input
+	}
+	return fmt.Sprintf("User input:\n%s\n\nModel output:\n%s", input, output)
 }
 
 // extractCompletionText pulls the assistant text out of a buffered completion.

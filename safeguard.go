@@ -21,13 +21,19 @@ const (
 	safeguardTemperature = 0.0
 )
 
-// policyStage tags where a policy applies: on the user input or on the model
-// output.
+// policyStage tags where a policy applies.
+//
+//   - input: checked against the user's messages before the model runs
+//   - output: checked against the model's response after it runs
+//   - turn: checked against the combined input + output after the model runs,
+//     so the policy can reason about the full conversation turn (e.g. did the
+//     model help commit a crime given what was asked and what was answered)
 type policyStage string
 
 const (
 	stageInput  policyStage = "input"
 	stageOutput policyStage = "output"
+	stageTurn   policyStage = "turn"
 )
 
 // loadedPolicy is a single policy parsed from policies.yaml.
@@ -39,11 +45,13 @@ type loadedPolicy struct {
 
 // policiesFile mirrors the on-disk shape of policies.yaml.
 type policiesFile struct {
-	Version  int `yaml:"version"`
-	Policies map[string]struct {
+	Version      int    `yaml:"version"`
+	DefaultGroup string `yaml:"default_group"`
+	Policies     map[string]struct {
 		Stage string `yaml:"stage"`
 		Text  string `yaml:"text"`
 	} `yaml:"policies"`
+	Groups map[string][]string `yaml:"groups"`
 }
 
 // checkResult is the structured output enforced by the safeguard model.
@@ -77,15 +85,17 @@ var checkResultSchema = map[string]any{
 
 // safeguardClient wraps a Tinfoil client for safety classification calls.
 type safeguardClient struct {
-	client   *tinfoil.Client
-	policies []loadedPolicy
+	client       *tinfoil.Client
+	policies     []loadedPolicy
+	groups       map[string][]string
+	defaultGroup string
 }
 
 // newSafeguardClient creates a safeguard client and loads policies from the
 // embedded policies.yaml. Panics if the policies are invalid — a bad policy
 // bundle is a build-time / deployment-time bug, not a runtime condition.
 func newSafeguardClient(client *tinfoil.Client) *safeguardClient {
-	sg := &safeguardClient{client: client}
+	sg := &safeguardClient{client: client, groups: make(map[string][]string)}
 	if err := sg.loadPolicies(); err != nil {
 		panic(fmt.Sprintf("safeguard: %v", err))
 	}
@@ -97,15 +107,19 @@ func (s *safeguardClient) loadPolicies() error {
 	if err := yaml.Unmarshal(policiesYAML, &pf); err != nil {
 		return fmt.Errorf("failed to parse policies.yaml: %w", err)
 	}
+
+	// Load policies.
+	policyNames := make(map[string]bool)
 	for name, p := range pf.Policies {
 		if p.Text == "" {
 			return fmt.Errorf("policy %q has empty text", name)
 		}
 		stage := policyStage(p.Stage)
-		if stage != stageInput && stage != stageOutput {
-			return fmt.Errorf("policy %q has invalid stage %q (want input or output)", name, p.Stage)
+		if stage != stageInput && stage != stageOutput && stage != stageTurn {
+			return fmt.Errorf("policy %q has invalid stage %q (want input, output, or turn)", name, p.Stage)
 		}
 		s.policies = append(s.policies, loadedPolicy{name: name, stage: stage, text: p.Text})
+		policyNames[name] = true
 	}
 	if len(s.policies) == 0 {
 		return fmt.Errorf("no policies loaded")
@@ -114,6 +128,34 @@ func (s *safeguardClient) loadPolicies() error {
 	slices.SortFunc(s.policies, func(a, b loadedPolicy) int {
 		return cmpString(a.name, b.name)
 	})
+
+	// Load groups.
+	if len(pf.Groups) == 0 {
+		return fmt.Errorf("no policy groups defined")
+	}
+	for groupName, names := range pf.Groups {
+		for _, name := range names {
+			if !policyNames[name] {
+				return fmt.Errorf("group %q references unknown policy %q", groupName, name)
+			}
+		}
+		s.groups[groupName] = names
+	}
+
+	// Resolve the default group.
+	s.defaultGroup = pf.DefaultGroup
+	if s.defaultGroup == "" {
+		groupNames := make([]string, 0, len(s.groups))
+		for g := range s.groups {
+			groupNames = append(groupNames, g)
+		}
+		slices.Sort(groupNames)
+		s.defaultGroup = groupNames[0]
+	}
+	if _, ok := s.groups[s.defaultGroup]; !ok {
+		return fmt.Errorf("default group %q not found in groups", s.defaultGroup)
+	}
+
 	return nil
 }
 
@@ -127,11 +169,24 @@ func cmpString(a, b string) int {
 	return 0
 }
 
-// checkStage runs every policy matching stage against content, in order.
-// Returns the first violation, or nil if all pass.
-func (s *safeguardClient) checkStage(ctx context.Context, stage policyStage, content string) (*violation, error) {
+// resolveGroup returns the group to use for a request. If group is empty,
+// returns the default group. Returns false if the group doesn't exist.
+func (s *safeguardClient) resolveGroup(group string) (string, bool) {
+	if group == "" {
+		return s.defaultGroup, true
+	}
+	if _, ok := s.groups[group]; !ok {
+		return "", false
+	}
+	return group, true
+}
+
+// checkStage runs every policy matching stage and group against content, in
+// order. Returns the first violation, or nil if all pass.
+func (s *safeguardClient) checkStage(ctx context.Context, stage policyStage, group, content string) (*violation, error) {
+	groupPolicies := s.groups[group]
 	for _, p := range s.policies {
-		if p.stage != stage {
+		if p.stage != stage || !slices.Contains(groupPolicies, p.name) {
 			continue
 		}
 		res, err := s.check(ctx, p.text, content)
