@@ -1,0 +1,26 @@
+# Tinfoil Container Configuration
+# For updates: edit this file, commit, run the workflow (e.g., v0.0.2)
+cvm-version: 0.10.8
+cpus: 2
+memory: 8192
+
+containers:
+  - name: "demo-safeguard"
+    image: "ghcr.io/dmccanns/demo-safeguard@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    restart: always
+    networks: [web]
+    secrets:
+      - TINFOIL_API_KEY
+
+networks:
+  web:
+    egress: open
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /v1/chat/completions
+    - /health
+  authenticated: true
+  authenticated-endpoints:
+    - /v1/chat/completions

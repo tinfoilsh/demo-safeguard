@@ -11,9 +11,6 @@ import (
 )
 
 func TestExtractMessagesText(t *testing.T) {
-	// Build params from JSON the way the real handler does (UnmarshalJSON
-	// populates the Role field; the SystemMessage/UserMessage constructors
-	// leave Role as a zero value with a marshal-time default).
 	body := `{"messages":[` +
 		`{"role":"system","content":"You are helpful."},` +
 		`{"role":"user","content":"Hello there"},` +
@@ -30,20 +27,111 @@ func TestExtractMessagesText(t *testing.T) {
 	}
 }
 
-func TestStreamRequested(t *testing.T) {
+func TestLoadPolicies(t *testing.T) {
+	sg := &safeguardClient{groups: make(map[string][]string)}
+	if err := sg.loadPolicies(); err != nil {
+		t.Fatalf("loadPolicies: %v", err)
+	}
+	if len(sg.policies) < 3 {
+		t.Fatalf("expected at least 3 policies, got %d", len(sg.policies))
+	}
+
+	byStage := map[policyStage][]string{}
+	for _, p := range sg.policies {
+		byStage[p.stage] = append(byStage[p.stage], p.name)
+	}
+	if len(byStage[stageInput]) == 0 {
+		t.Error("no input-stage policies")
+	}
+	if len(byStage[stageOutput]) == 0 {
+		t.Error("no output-stage policies")
+	}
+	if len(byStage[stageTurn]) == 0 {
+		t.Error("no turn-stage policies")
+	}
+
+	found := false
+	for _, p := range sg.policies {
+		if p.name == "trained_dolphins" && p.stage == stageTurn {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("trained_dolphins policy not found on turn stage")
+	}
+
+	if len(sg.groups) < 2 {
+		t.Fatalf("expected at least 2 groups, got %d", len(sg.groups))
+	}
+	if sg.defaultGroup == "" {
+		t.Error("no default group set")
+	}
+	if _, ok := sg.groups[sg.defaultGroup]; !ok {
+		t.Errorf("default group %q not in groups", sg.defaultGroup)
+	}
+}
+
+func TestResolveGroup(t *testing.T) {
+	sg := &safeguardClient{groups: make(map[string][]string)}
+	if err := sg.loadPolicies(); err != nil {
+		t.Fatalf("loadPolicies: %v", err)
+	}
+
+	g, ok := sg.resolveGroup("")
+	if !ok {
+		t.Fatal(`resolveGroup("") should succeed`)
+	}
+	if g != sg.defaultGroup {
+		t.Errorf(`resolveGroup("")=%q want %q`, g, sg.defaultGroup)
+	}
+
+	for name := range sg.groups {
+		g, ok := sg.resolveGroup(name)
+		if !ok || g != name {
+			t.Errorf("resolveGroup(%q)=%q,%v want %q,true", name, g, ok, name)
+		}
+	}
+
+	_, ok = sg.resolveGroup("nonexistent")
+	if ok {
+		t.Error(`resolveGroup("nonexistent") should fail`)
+	}
+}
+
+func TestParseRequestMeta(t *testing.T) {
 	cases := []struct {
-		body string
-		want bool
+		body   string
+		stream bool
+		group  string
 	}{
-		{`{"stream":true,"model":"x"}`, true},
-		{`{"stream":false,"model":"x"}`, false},
-		{`{"model":"x"}`, false},
-		{`not json`, false},
+		{`{"stream":true,"policy_group":"group2"}`, true, "group2"},
+		{`{"stream":false,"model":"x"}`, false, ""},
+		{`{"model":"x"}`, false, ""},
+		{`{"policy_group":"group1"}`, false, "group1"},
+		{`not json`, false, ""},
 	}
 	for _, c := range cases {
-		if got := streamRequested([]byte(c.body)); got != c.want {
-			t.Errorf("streamRequested(%s)=%v want %v", c.body, got, c.want)
+		m := parseRequestMeta([]byte(c.body))
+		if m.Stream != c.stream {
+			t.Errorf("parseRequestMeta(%s).Stream=%v want %v", c.body, m.Stream, c.stream)
 		}
+		if m.PolicyGroup != c.group {
+			t.Errorf("parseRequestMeta(%s).PolicyGroup=%q want %q", c.body, m.PolicyGroup, c.group)
+		}
+	}
+}
+
+func TestFormatTurnText(t *testing.T) {
+	got := formatTurnText("hello", "world")
+	want := "User input:\nhello\n\nModel output:\nworld"
+	if got != want {
+		t.Errorf("formatTurnText both:\n got=%q\nwant=%q", got, want)
+	}
+	if got := formatTurnText("", "world"); got != "Model output:\nworld" {
+		t.Errorf("formatTurnText empty input: %q", got)
+	}
+	if got := formatTurnText("hello", ""); got != "User input:\nhello" {
+		t.Errorf("formatTurnText empty output: %q", got)
 	}
 }
 
@@ -80,14 +168,12 @@ func TestWriteStreamEmitsSSE(t *testing.T) {
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("missing [DONE]:\n%s", body)
 	}
-	// Should have a role chunk, content chunks, and a stop chunk.
 	if !strings.Contains(body, `"role":"assistant"`) {
 		t.Errorf("missing role chunk:\n%s", body)
 	}
 	if !strings.Contains(body, `"finish_reason":"stop"`) {
 		t.Errorf("missing stop chunk:\n%s", body)
 	}
-	// Parse each data line as JSON.
 	lines := strings.Split(body, "\n")
 	var chunks int
 	for _, l := range lines {

@@ -5,19 +5,54 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/shared"
 	"github.com/tinfoilsh/tinfoil-go"
+	"gopkg.in/yaml.v3"
 )
 
-//go:embed policy.txt
-var safeguardPolicy string
+//go:embed policies.yaml
+var policiesYAML []byte
 
 const (
-	safeguardModelDefault = "gpt-oss-safeguard-120b"
-	safeguardTemperature  = 0.0
+	safeguardModel       = "gpt-oss-safeguard-120b"
+	safeguardTemperature = 0.0
 )
+
+// policyStage tags where a policy applies.
+//
+//   - input: checked against the user's messages before the model runs
+//   - output: checked against the model's response after it runs
+//   - turn: checked against the combined input + output after the model runs,
+//     so the policy can reason about the full conversation turn (e.g. did the
+//     model help commit a crime given what was asked and what was answered)
+type policyStage string
+
+const (
+	stageInput  policyStage = "input"
+	stageOutput policyStage = "output"
+	stageTurn   policyStage = "turn"
+)
+
+// loadedPolicy is a single policy parsed from policies.yaml.
+type loadedPolicy struct {
+	name  string
+	stage policyStage
+	text  string
+}
+
+// policiesFile mirrors the on-disk shape of policies.yaml.
+type policiesFile struct {
+	Version      int    `yaml:"version"`
+	DefaultGroup string `yaml:"default_group"`
+	Policies     map[string]struct {
+		Stage string `yaml:"stage"`
+		Text  string `yaml:"text"`
+	} `yaml:"policies"`
+	Groups map[string][]string `yaml:"groups"`
+}
 
 // checkResult is the structured output enforced by the safeguard model.
 type checkResult struct {
@@ -25,6 +60,13 @@ type checkResult struct {
 	Rationale string `json:"rationale"`
 }
 
+// violation is a positive safeguard hit from a specific policy.
+type violation struct {
+	policy    string
+	rationale string
+}
+
+// checkResultSchema is the JSON schema for structured output enforcement.
 var checkResultSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
@@ -43,24 +85,127 @@ var checkResultSchema = map[string]any{
 
 // safeguardClient wraps a Tinfoil client for safety classification calls.
 type safeguardClient struct {
-	client *tinfoil.Client
-	model  string
+	client       *tinfoil.Client
+	policies     []loadedPolicy
+	groups       map[string][]string
+	defaultGroup string
 }
 
-func newSafeguardClient(client *tinfoil.Client, model string) *safeguardClient {
-	if model == "" {
-		model = safeguardModelDefault
+// newSafeguardClient creates a safeguard client and loads policies from the
+// embedded policies.yaml. Panics if the policies are invalid — a bad policy
+// bundle is a build-time / deployment-time bug, not a runtime condition.
+func newSafeguardClient(client *tinfoil.Client) *safeguardClient {
+	sg := &safeguardClient{client: client, groups: make(map[string][]string)}
+	if err := sg.loadPolicies(); err != nil {
+		panic(fmt.Sprintf("safeguard: %v", err))
 	}
-	return &safeguardClient{client: client, model: model}
+	return sg
 }
 
-// check runs the safeguard model against content using the embedded policy.
-// Returns the parsed result, or an error if the call or parsing fails.
-func (s *safeguardClient) check(ctx context.Context, content string) (*checkResult, error) {
+func (s *safeguardClient) loadPolicies() error {
+	var pf policiesFile
+	if err := yaml.Unmarshal(policiesYAML, &pf); err != nil {
+		return fmt.Errorf("failed to parse policies.yaml: %w", err)
+	}
+
+	// Load policies.
+	policyNames := make(map[string]bool)
+	for name, p := range pf.Policies {
+		if p.Text == "" {
+			return fmt.Errorf("policy %q has empty text", name)
+		}
+		stage := policyStage(p.Stage)
+		if stage != stageInput && stage != stageOutput && stage != stageTurn {
+			return fmt.Errorf("policy %q has invalid stage %q (want input, output, or turn)", name, p.Stage)
+		}
+		s.policies = append(s.policies, loadedPolicy{name: name, stage: stage, text: p.Text})
+		policyNames[name] = true
+	}
+	if len(s.policies) == 0 {
+		return fmt.Errorf("no policies loaded")
+	}
+	// Deterministic order so "first violation wins" is stable.
+	slices.SortFunc(s.policies, func(a, b loadedPolicy) int {
+		return cmpString(a.name, b.name)
+	})
+
+	// Load groups.
+	if len(pf.Groups) == 0 {
+		return fmt.Errorf("no policy groups defined")
+	}
+	for groupName, names := range pf.Groups {
+		for _, name := range names {
+			if !policyNames[name] {
+				return fmt.Errorf("group %q references unknown policy %q", groupName, name)
+			}
+		}
+		s.groups[groupName] = names
+	}
+
+	// Resolve the default group.
+	s.defaultGroup = pf.DefaultGroup
+	if s.defaultGroup == "" {
+		groupNames := make([]string, 0, len(s.groups))
+		for g := range s.groups {
+			groupNames = append(groupNames, g)
+		}
+		slices.Sort(groupNames)
+		s.defaultGroup = groupNames[0]
+	}
+	if _, ok := s.groups[s.defaultGroup]; !ok {
+		return fmt.Errorf("default group %q not found in groups", s.defaultGroup)
+	}
+
+	return nil
+}
+
+func cmpString(a, b string) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// resolveGroup returns the group to use for a request. If group is empty,
+// returns the default group. Returns false if the group doesn't exist.
+func (s *safeguardClient) resolveGroup(group string) (string, bool) {
+	if group == "" {
+		return s.defaultGroup, true
+	}
+	if _, ok := s.groups[group]; !ok {
+		return "", false
+	}
+	return group, true
+}
+
+// checkStage runs every policy matching stage and group against content, in
+// order. Returns the first violation, or nil if all pass.
+func (s *safeguardClient) checkStage(ctx context.Context, stage policyStage, group, content string) (*violation, error) {
+	groupPolicies := s.groups[group]
+	for _, p := range s.policies {
+		if p.stage != stage || !slices.Contains(groupPolicies, p.name) {
+			continue
+		}
+		res, err := s.check(ctx, p.text, content)
+		if err != nil {
+			return nil, fmt.Errorf("policy %q: %w", p.name, err)
+		}
+		if res.Violation {
+			return &violation{policy: p.name, rationale: res.Rationale}, nil
+		}
+	}
+	return nil, nil
+}
+
+// check runs the safeguard model against content using a policy.
+func (s *safeguardClient) check(ctx context.Context, policy, content string) (*checkResult, error) {
 	resp, err := s.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: shared.ChatModel(s.model),
+		Model: shared.ChatModel(safeguardModel),
 		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(safeguardPolicy),
+			openai.SystemMessage(policy),
 			openai.UserMessage(content),
 		},
 		Temperature: openai.Float(safeguardTemperature),
