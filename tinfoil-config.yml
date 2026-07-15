@@ -6,7 +6,7 @@ memory: 8192
 
 containers:
   - name: "demo-safeguard"
-    image: "ghcr.io/tinfoilsh/demo-safeguard@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/demo-safeguard@sha256:3a1b947a780b1ca3d3a438a6535b0a2b5610b394d1812c36c417cf3b8b261bf6" # v0.0.3
     restart: always
     networks: [web]
     secrets:
