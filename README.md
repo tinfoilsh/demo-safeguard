@@ -67,9 +67,9 @@ The `param` field is `"user_message"` or `"model_message"` indicating which chec
 
 ## Policies
 
-Policies live in [`policies.yaml`](policies.yaml), embedded at build time. Each policy has a `stage` — `user_message` (checked before the model runs) or `model_message` (checked on the model's response). Swap the file and rebuild to change what's blocked.
+Policies live in [`policies.yaml`](policies.yaml), embedded at build time. Each policy has a `surface` — `user_message` (checked before the model runs) or `model_message` (checked on the model's response). Swap the file and rebuild to change what's blocked.
 
-| Policy             | Stage          | What it blocks                                    |
+| Policy             | Surface        | What it blocks                                    |
 | ------------------ | -------------- | ------------------------------------------------- |
 | `prompt_injection` | user\_ message | Prompt injection attempts in the user's m essages |
 | `baked_bread`      | model_message  | References to baked bread in the model's response |
