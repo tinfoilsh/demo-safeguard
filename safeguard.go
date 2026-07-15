@@ -21,26 +21,27 @@ const (
 	safeguardTemperature = 0.0
 )
 
-// policyStage tags where a policy applies.
+// policySurface tags where a policy applies.
 //
-//   - input: checked against the user's messages before the model runs
-//   - output: checked against the model's response after it runs
-//   - turn: checked against the combined input + output after the model runs,
-//     so the policy can reason about the full conversation turn (e.g. did the
-//     model help commit a crime given what was asked and what was answered)
-type policyStage string
+//   - user_message: checked against the user's messages before the model runs
+//   - model_message: checked against the model's response after it runs
+//   - turn: checked against the combined user + model messages after the model
+//     runs, so the policy can reason about the full conversation turn (e.g.
+//     did the model help commit a crime given what was asked and what was
+//     answered)
+type policySurface string
 
 const (
-	stageInput  policyStage = "input"
-	stageOutput policyStage = "output"
-	stageTurn   policyStage = "turn"
+	surfaceUserMessage  policySurface = "user_message"
+	surfaceModelMessage policySurface = "model_message"
+	surfaceTurn         policySurface = "turn"
 )
 
 // loadedPolicy is a single policy parsed from policies.yaml.
 type loadedPolicy struct {
-	name  string
-	stage policyStage
-	text  string
+	name    string
+	surface policySurface
+	text    string
 }
 
 // policiesFile mirrors the on-disk shape of policies.yaml.
@@ -48,8 +49,8 @@ type policiesFile struct {
 	Version      int    `yaml:"version"`
 	DefaultGroup string `yaml:"default_group"`
 	Policies     map[string]struct {
-		Stage string `yaml:"stage"`
-		Text  string `yaml:"text"`
+		Surface string `yaml:"surface"`
+		Text    string `yaml:"text"`
 	} `yaml:"policies"`
 	Groups map[string][]string `yaml:"groups"`
 }
@@ -114,11 +115,11 @@ func (s *safeguardClient) loadPolicies() error {
 		if p.Text == "" {
 			return fmt.Errorf("policy %q has empty text", name)
 		}
-		stage := policyStage(p.Stage)
-		if stage != stageInput && stage != stageOutput && stage != stageTurn {
-			return fmt.Errorf("policy %q has invalid stage %q (want input, output, or turn)", name, p.Stage)
+		surface := policySurface(p.Surface)
+		if surface != surfaceUserMessage && surface != surfaceModelMessage && surface != surfaceTurn {
+			return fmt.Errorf("policy %q has invalid surface %q (want user_message, model_message, or turn)", name, p.Surface)
 		}
-		s.policies = append(s.policies, loadedPolicy{name: name, stage: stage, text: p.Text})
+		s.policies = append(s.policies, loadedPolicy{name: name, surface: surface, text: p.Text})
 		policyNames[name] = true
 	}
 	if len(s.policies) == 0 {
@@ -181,12 +182,12 @@ func (s *safeguardClient) resolveGroup(group string) (string, bool) {
 	return group, true
 }
 
-// checkStage runs every policy matching stage and group against content, in
-// order. Returns the first violation, or nil if all pass.
-func (s *safeguardClient) checkStage(ctx context.Context, stage policyStage, group, content string) (*violation, error) {
+// checkSurface runs every policy matching surface and group against content,
+// in order. Returns the first violation, or nil if all pass.
+func (s *safeguardClient) checkSurface(ctx context.Context, surface policySurface, group, content string) (*violation, error) {
 	groupPolicies := s.groups[group]
 	for _, p := range s.policies {
-		if p.stage != stage || !slices.Contains(groupPolicies, p.name) {
+		if p.surface != surface || !slices.Contains(groupPolicies, p.name) {
 			continue
 		}
 		res, err := s.check(ctx, p.text, content)
