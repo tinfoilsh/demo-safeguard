@@ -1,8 +1,8 @@
 Demonstration of applying safeguards to a model server side.
 
-Right now we apply a prompt injection policy to the input. Then, we apply a mock policy around bread to the output.
+Right now we apply a prompt injection policy to the user's message. Then, we apply a mock policy around bread to the model's message.
 
-Applying the policy to the output means that we need to buffer model output on the server, and then re-stream it.
+Applying the policy to the model's message means that we need to buffer the model's response on the server, and then re-stream it.
 
 ## Run
 
@@ -40,7 +40,7 @@ The `model` field is ignored — every request goes to `gpt-oss-120b`. All other
 ### Blocked request
 
 ```bash
-# input blocked by the prompt_injection policy
+# user_message blocked by the prompt_injection policy
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -49,9 +49,9 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 
 # HTTP 403
-# {"error":{"message":"input blocked by safeguard policy \"prompt_injection\": ...","type":"safeguard_violation","param":"input","code":"safeguard_violation"}}
+# {"error":{"message":"user_message blocked by safeguard policy \"prompt_injection\": ...","type":"safeguard_violation","param":"user_message","code":"safeguard_violation"}}
 
-# output blocked by the baked_bread policy
+# model_message blocked by the baked_bread policy
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -60,16 +60,16 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 
 # HTTP 403
-# {"error":{"message":"output blocked by safeguard policy \"baked_bread\": ...","type":"safeguard_violation","param":"output","code":"safeguard_violation"}}
+# {"error":{"message":"model_message blocked by safeguard policy \"baked_bread\": ...","type":"safeguard_violation","param":"model_message","code":"safeguard_violation"}}
 ```
 
-The `param` field is `"input"` or `"output"` indicating which check triggered. The error message names which policy fired.
+The `param` field is `"user_message"` or `"model_message"` indicating which check triggered. The error message names which policy fired.
 
 ## Policies
 
-Policies live in [`policies.yaml`](policies.yaml), embedded at build time. Each policy has a `stage` — `input` (checked before the model runs) or `output` (checked on the model's response). Swap the file and rebuild to change what's blocked.
+Policies live in [`policies.yaml`](policies.yaml), embedded at build time. Each policy has a `stage` — `user_message` (checked before the model runs) or `model_message` (checked on the model's response). Swap the file and rebuild to change what's blocked.
 
-| Policy | Stage | What it blocks |
-| --- | --- | --- |
-| `prompt_injection` | input | Prompt injection attempts in the user's messages |
-| `baked_bread` | output | References to baked bread in the model's response |
+| Policy             | Stage          | What it blocks                                    |
+| ------------------ | -------------- | ------------------------------------------------- |
+| `prompt_injection` | user\_ message | Prompt injection attempts in the user's m essages |
+| `baked_bread`      | model_message  | References to baked bread in the model's response |

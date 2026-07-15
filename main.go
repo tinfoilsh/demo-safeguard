@@ -84,7 +84,7 @@ func main() {
 }
 
 // chatHandler returns a handler that proxies chat completions to gpt-oss with
-// safeguard checks on both input and output.
+// safeguard checks on both the user message and the model message.
 func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := readBody(w, r)
@@ -115,18 +115,18 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 			return
 		}
 
-		// 1. Safeguard the input: concatenate every message's text content.
+		// 1. Safeguard the user message: concatenate every message's text content.
 		inputText := extractMessagesText(params.Messages)
 		if inputText != "" {
-			v, err := sg.checkStage(r.Context(), stageInput, group, inputText)
+			v, err := sg.checkSurface(r.Context(), surfaceUserMessage, group, inputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
-					"input safeguard check failed: "+err.Error(), "")
+					"user_message safeguard check failed: "+err.Error(), "")
 				return
 			}
 			if v != nil {
 				writeOpenAIError(w, http.StatusForbidden, "safeguard_violation",
-					fmt.Sprintf("input blocked by safeguard policy %q: %s", v.policy, v.rationale), "input")
+					fmt.Sprintf("user_message blocked by safeguard policy %q: %s", v.policy, v.rationale), "user_message")
 				return
 			}
 		}
@@ -146,28 +146,28 @@ func chatHandler(client *tinfoil.Client, sg *safeguardClient) http.HandlerFunc {
 			return
 		}
 
-		// 3. Safeguard the output.
+		// 3. Safeguard the model message (text + tool call arguments).
 		outputText := extractCompletionText(completion)
 		if outputText != "" {
-			v, err := sg.checkStage(r.Context(), stageOutput, group, outputText)
+			v, err := sg.checkSurface(r.Context(), surfaceModelMessage, group, outputText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
-					"output safeguard check failed: "+err.Error(), "")
+					"model_message safeguard check failed: "+err.Error(), "")
 				return
 			}
 			if v != nil {
 				writeOpenAIError(w, http.StatusForbidden, "safeguard_violation",
-					fmt.Sprintf("output blocked by safeguard policy %q: %s", v.policy, v.rationale), "output")
+					fmt.Sprintf("model_message blocked by safeguard policy %q: %s", v.policy, v.rationale), "model_message")
 				return
 			}
 		}
 
-		// 4. Safeguard the turn: check all turn-stage policies in the group
-		// against the combined input + output. This lets policies reason about
-		// the full conversation (e.g. did the model help commit a crime).
+		// 4. Safeguard the turn: check all turn-surface policies in the group
+		// against the combined user + model messages. This lets policies reason
+		// about the full conversation (e.g. did the model help commit a crime).
 		if inputText != "" || outputText != "" {
 			turnText := formatTurnText(inputText, outputText)
-			v, err := sg.checkStage(r.Context(), stageTurn, group, turnText)
+			v, err := sg.checkSurface(r.Context(), surfaceTurn, group, turnText)
 			if err != nil {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error",
 					"turn safeguard check failed: "+err.Error(), "")
@@ -259,8 +259,8 @@ func messageContentText(content any) string {
 	return ""
 }
 
-// formatTurnText combines input and output into a single text for turn-stage
-// policies, which reason about the full conversation.
+// formatTurnText combines the user and model messages into a single text for
+// turn-surface policies, which reason about the full conversation.
 func formatTurnText(input, output string) string {
 	if input == "" {
 		return "Model output:\n" + output
@@ -271,13 +271,36 @@ func formatTurnText(input, output string) string {
 	return fmt.Sprintf("User input:\n%s\n\nModel output:\n%s", input, output)
 }
 
-// extractCompletionText pulls the assistant text out of a buffered completion.
+// extractCompletionText pulls the assistant text and tool calls out of a
+// buffered completion. Tool call names and arguments are serialized alongside
+// the text content so the safeguard inspects what the model asks tools to do,
+// not just its prose.
 func extractCompletionText(c *openai.ChatCompletion) string {
 	var b strings.Builder
 	for _, choice := range c.Choices {
 		b.WriteString(choice.Message.Content)
+		for _, tc := range choice.Message.ToolCalls {
+			if line := toolCallText(tc); line != "" {
+				if b.Len() > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString(line)
+			}
+		}
 	}
 	return b.String()
+}
+
+// toolCallText renders a single tool call as text for safeguard inspection.
+func toolCallText(tc openai.ChatCompletionMessageToolCallUnion) string {
+	switch tc.Type {
+	case "function":
+		return fmt.Sprintf("tool_call(function): name=%s arguments=%s", tc.Function.Name, tc.Function.Arguments)
+	case "custom":
+		return fmt.Sprintf("tool_call(custom): name=%s input=%s", tc.Custom.Name, tc.Custom.Input)
+	default:
+		return ""
+	}
 }
 
 // --- response writers ---

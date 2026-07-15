@@ -27,6 +27,73 @@ func TestExtractMessagesText(t *testing.T) {
 	}
 }
 
+func TestExtractCompletionText(t *testing.T) {
+	// Plain content, no tool calls.
+	c := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{Message: openai.ChatCompletionMessage{Content: "hello world"}},
+		},
+	}
+	if got := extractCompletionText(c); got != "hello world" {
+		t.Errorf("plain content: got %q want %q", got, "hello world")
+	}
+
+	// Content alongside a function tool call.
+	c = &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{Message: openai.ChatCompletionMessage{
+				Content: "let me check",
+				ToolCalls: []openai.ChatCompletionMessageToolCallUnion{
+					{Type: "function", Function: openai.ChatCompletionMessageFunctionToolCallFunction{
+						Name: "get_weather", Arguments: `{"location":"Paris"}`,
+					}},
+				},
+			}},
+		},
+	}
+	got := extractCompletionText(c)
+	want := "let me check\ntool_call(function): name=get_weather arguments={\"location\":\"Paris\"}"
+	if got != want {
+		t.Errorf("content+tool:\n got=%q\nwant=%q", got, want)
+	}
+
+	// Tool-call only with empty content — must not be skipped.
+	c = &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{Message: openai.ChatCompletionMessage{
+				ToolCalls: []openai.ChatCompletionMessageToolCallUnion{
+					{Type: "function", Function: openai.ChatCompletionMessageFunctionToolCallFunction{
+						Name: "delete_file", Arguments: `{"path":"/etc/passwd"}`,
+					}},
+				},
+			}},
+		},
+	}
+	got = extractCompletionText(c)
+	want = `tool_call(function): name=delete_file arguments={"path":"/etc/passwd"}`
+	if got != want {
+		t.Errorf("tool-only:\n got=%q\nwant=%q", got, want)
+	}
+
+	// Custom tool call variant.
+	c = &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{Message: openai.ChatCompletionMessage{
+				ToolCalls: []openai.ChatCompletionMessageToolCallUnion{
+					{Type: "custom", Custom: openai.ChatCompletionMessageCustomToolCallCustom{
+						Name: "lookup", Input: `{"q":"bread"}`,
+					}},
+				},
+			}},
+		},
+	}
+	got = extractCompletionText(c)
+	want = `tool_call(custom): name=lookup input={"q":"bread"}`
+	if got != want {
+		t.Errorf("custom tool:\n got=%q\nwant=%q", got, want)
+	}
+}
+
 func TestLoadPolicies(t *testing.T) {
 	sg := &safeguardClient{groups: make(map[string][]string)}
 	if err := sg.loadPolicies(); err != nil {
@@ -36,28 +103,28 @@ func TestLoadPolicies(t *testing.T) {
 		t.Fatalf("expected at least 3 policies, got %d", len(sg.policies))
 	}
 
-	byStage := map[policyStage][]string{}
+	bySurface := map[policySurface][]string{}
 	for _, p := range sg.policies {
-		byStage[p.stage] = append(byStage[p.stage], p.name)
+		bySurface[p.surface] = append(bySurface[p.surface], p.name)
 	}
-	if len(byStage[stageInput]) == 0 {
-		t.Error("no input-stage policies")
+	if len(bySurface[surfaceUserMessage]) == 0 {
+		t.Error("no user_message-surface policies")
 	}
-	if len(byStage[stageOutput]) == 0 {
-		t.Error("no output-stage policies")
+	if len(bySurface[surfaceModelMessage]) == 0 {
+		t.Error("no model_message-surface policies")
 	}
-	if len(byStage[stageTurn]) == 0 {
-		t.Error("no turn-stage policies")
+	if len(bySurface[surfaceTurn]) == 0 {
+		t.Error("no turn-surface policies")
 	}
 
 	found := false
 	for _, p := range sg.policies {
-		if p.name == "trained_dolphins" && p.stage == stageTurn {
+		if p.name == "trained_dolphins" && p.surface == surfaceTurn {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("trained_dolphins policy not found on turn stage")
+		t.Error("trained_dolphins policy not found on turn surface")
 	}
 
 	if len(sg.groups) < 2 {
